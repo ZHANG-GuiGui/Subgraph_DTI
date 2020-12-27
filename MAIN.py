@@ -4,6 +4,7 @@ import sys, copy, math, time, pdb
 import pickle
 import scipy.io as sio
 import scipy.sparse as ssp
+from sklearn.model_selection import KFold
 import os.path
 import random
 import argparse
@@ -17,7 +18,7 @@ matplotlib.use('PDF')
 
 parser = argparse.ArgumentParser(description='Link Prediction for AOPEDF')
 # general settings
-parser.add_argument('--data-name', default=None, help='network name')
+parser.add_argument('--data-name', default='AOPEDF', help='network name')
 #parser.add_argument('--train-name', default=None, help='train name')
 #parser.add_argument('--test-name', default=None, help='test name')
 parser.add_argument('--only-predict', action='store_true', default=False,
@@ -114,7 +115,11 @@ train_graphs, test_graphs, max_n_label = util_functions.links2subgraphs(
     node_information, 
     False
 )
-print('# train: %d, # test: %d' % (len(train_graphs), len(test_graphs)))
+#print('# train: %d, # test: %d' % (len(train_graphs), len(test_graphs)))
+
+total_graph = train_graphs + test_graphs
+kf = KFold(n_splits=5, shuffle=True)
+kf.get_n_splits(total_graph)
 
 # DGCNN configurations
 cmd_args.gm = 'DGCNN'
@@ -138,61 +143,80 @@ if cmd_args.sortpooling_k <= 1:
     cmd_args.sortpooling_k = max(10, num_nodes_list[k_])
     print('k used in SortPooling is: ' + str(cmd_args.sortpooling_k))
 
-classifier = main.Classifier()
-if cmd_args.mode == 'gpu':
-    classifier = classifier.cuda()
+total_best_acc = []
+total_best_auc = []
+total_best_aupr = []
+for train_ind, test_ind in kf.split(total_graph):
+    train_graphs = []
+    test_graphs = []
+    for i in train_ind:
+        train_graphs.append(total_graph[i])
+    for j in test_ind:
+        test_graphs.append(total_graph[j])
+    classifier = main.Classifier()
+    if cmd_args.mode == 'gpu':
+        classifier = classifier.cuda()
 
-optimizer = optim.Adam(classifier.parameters(), lr=cmd_args.learning_rate)
+    optimizer = optim.Adam(classifier.parameters(), lr=cmd_args.learning_rate)
 
-random.shuffle(train_graphs)
-val_num = int(0.1 * len(train_graphs))
-val_graphs = train_graphs[:val_num]
-train_graphs = train_graphs[val_num:]
+    random.shuffle(train_graphs)
+    val_num = int(0.1 * len(train_graphs))
+    val_graphs = train_graphs[:val_num]
+    train_graphs = train_graphs[val_num:]
 
-train_idxes = list(range(len(train_graphs)))
-best_loss = None
-best_epoch = None
-for epoch in range(cmd_args.num_epochs):
-    random.shuffle(train_idxes)
-    classifier.train()
-    avg_loss,_,_ = main.loop_dataset(
-        train_graphs, classifier, train_idxes, optimizer=optimizer, bsize=args.batch_size
-    )
-    if not cmd_args.printAUC:
-        avg_loss[2] = 0.0
-    print('\033[92maverage training of epoch %d: loss %.5f acc %.5f auc %.5f aupr %.5f\033[0m' % (
-        epoch, avg_loss[0], avg_loss[1], avg_loss[2], avg_loss[3]))
-
-    classifier.eval()
-    val_loss,_,_ = main.loop_dataset(val_graphs, classifier, list(range(len(val_graphs))))
-    if not cmd_args.printAUC:
-        val_loss[2] = 0.0
-    print('\033[93maverage validation of epoch %d: loss %.5f acc %.5f auc %.5f aupr %.5f\033[0m' % (
-        epoch, val_loss[0], val_loss[1], val_loss[2], val_loss[3]))
-    if best_loss is None:
-        best_loss = val_loss
-    if val_loss[0] <= best_loss[0]:
-        best_loss = val_loss
-        best_epoch = epoch
-        test_loss,precision, recall = main.loop_dataset(test_graphs, classifier, list(range(len(test_graphs))))
+    train_idxes = list(range(len(train_graphs)))
+    best_loss = None
+    best_epoch = None
+    for epoch in range(cmd_args.num_epochs):
+        random.shuffle(train_idxes)
+        classifier.train()
+        avg_loss,_,_ = main.loop_dataset(
+            train_graphs, classifier, train_idxes, optimizer=optimizer, bsize=args.batch_size
+        )
         if not cmd_args.printAUC:
-            test_loss[2] = 0.0
-        print('\033[94maverage test of epoch %d: loss %.5f acc %.5f auc %.5f aupr %.5f\033[0m' % (
-            epoch, test_loss[0], test_loss[1], test_loss[2], test_loss[3]))
-        plt.figure()
-        plt.plot(recall, precision , 'b', label='AUPR = %0.3f %%' % test_loss[3]*100)
-        plt.plot([0, 1], [0, 1],'r--')
-        plt.xlim([0.0, 1.0])
-        plt.ylim([0.35, 1.05])
-        plt.xlabel('Recall')
-        plt.ylabel('Precision')
-        plt.title('PR curve')
-        plt.legend(loc="lower right")
-        plt.savefig('./figure/fig%d.pdf' %epoch)
+            avg_loss[2] = 0.0
+        print('\033[92maverage training of epoch %d: loss %.5f acc %.5f auc %.5f aupr %.5f\033[0m' % (
+            epoch, avg_loss[0], avg_loss[1], avg_loss[2], avg_loss[3]))
 
-print('\033[95mFinal test performance: epoch %d: loss %.5f acc %.5f auc %.5f aupr %0.5f\033[0m' % (
-    best_epoch, test_loss[0], test_loss[1], test_loss[2], test_loss[3]))
+        classifier.eval()
+        val_loss,_,_ = main.loop_dataset(val_graphs, classifier, list(range(len(val_graphs))))
+        if not cmd_args.printAUC:
+            val_loss[2] = 0.0
+        print('\033[93maverage validation of epoch %d: loss %.5f acc %.5f auc %.5f aupr %.5f\033[0m' % (
+            epoch, val_loss[0], val_loss[1], val_loss[2], val_loss[3]))
+        if best_loss is None:
+            best_loss = val_loss
+        if val_loss[0] <= best_loss[0]:
+            best_loss = val_loss
+            best_epoch = epoch
+            test_loss,precision, recall = main.loop_dataset(test_graphs, classifier, list(range(len(test_graphs))))
+            if not cmd_args.printAUC:
+                test_loss[2] = 0.0
+            print('\033[94maverage test of epoch %d: loss %.5f acc %.5f auc %.5f aupr %.5f\033[0m' % (
+                epoch, test_loss[0], test_loss[1], test_loss[2], test_loss[3]))
+            '''
+            plt.figure()
+            plt.plot(recall, precision , 'b', label='AUPR = %0.3f %%' % test_loss[3]*100)
+            plt.plot([0, 1], [0, 1],'r--')
+            plt.xlim([0.0, 1.0])
+            plt.ylim([0.35, 1.05])
+            plt.xlabel('Recall')
+            plt.ylabel('Precision')
+            plt.title('PR curve')
+            plt.legend(loc="lower right")
+            plt.savefig('./figure/fig%d.pdf' %epoch)
+            '''
 
+    print('\033[95mFinal test performance: epoch %d: loss %.5f acc %.5f auc %.5f aupr %0.5f\033[0m' % (
+        best_epoch, test_loss[0], test_loss[1], test_loss[2], test_loss[3]))
+    total_best_acc.append(test_loss[1])
+    total_best_auc.append(test_loss[2])
+    total_best_aupr.append(test_loss[3])
+final_acc = np.mean(total_best_acc)
+final_auc = np.mean(total_best_auc)
+final_aupr = np.mean(total_best_aupr)
+print('Final performance: acc %.5f auc %.5f aupr %.5f\n'%(final_acc, final_auc,final_aupr))
+'''
 if args.save_model:
     model_name = 'data/{}_model.pth'.format(args.data_name)
     print('Saving final model states to {}...'.format(model_name))
@@ -201,13 +225,14 @@ if args.save_model:
     with open(hyper_name, 'wb') as hyperparameters_file:
         pickle.dump(cmd_args, hyperparameters_file)
         print('Saving hyperparameters to {}...'.format(hyper_name))
+'''
 
 with open('acc_results.txt', 'a+') as f:
-    f.write(str(args.embed_dim)+'_'+str(args.which_embedding) +':  '+str(test_loss[1]) + '\n')
+    f.write(str(args.embed_dim)+'_'+str(args.which_embedding) +':  '+str(final_acc) + '\n')
 
 if cmd_args.printAUC:
     with open('auc_results.txt', 'a+') as f:
-        f.write(str(args.embed_dim)+'_'+str(args.which_embedding) +':  '+str(test_loss[2]) + '\n')
+        f.write(str(args.embed_dim)+'_'+str(args.which_embedding) +':  '+str(final_auc) + '\n')
     with open('aupr_results.txt', 'a+') as f:
-    	f.write(str(args.embed_dim)+'_'+str(args.which_embedding) +':  '+str(test_loss[3]) + '\n')
+    	f.write(str(args.embed_dim)+'_'+str(args.which_embedding) +':  '+str(final_aupr) + '\n')
 
